@@ -1306,6 +1306,18 @@ class KBsonTest {
             })
         }
 
+        // class discriminator at a non-standard location
+        val doc6 = BsonDocument().apply {
+            append("payload", BsonDocument().apply {
+                append("_id", BsonObjectId(ObjectId("5d1777814e8c7b408a6ada73")))
+                append("someData", BsonString("something"))
+                append(
+                    conf.classDiscriminator,
+                    BsonString("com.github.jershell.kbson.models.polymorph.SMessage.DataWithObjectId")
+                )
+            })
+        }
+
         val polyBson = KBson(serializersModule = DefaultModule + pModule)
 
         val res1 = polyBson.parse(SealedWrapper.serializer(), doc1)
@@ -1318,6 +1330,8 @@ class KBsonTest {
 
         val res5 = polyBson.parse(SealedWrapper.serializer(), doc5)
 
+        val res6 = polyBson.parse(SealedWrapper.serializer(), doc6)
+
         assertTrue(res1.payload is SMessage.Error)
         assertTrue(res2.payload is SMessage.Loading)
         assertEquals(SealedWrapper(SMessage.Data(someData = "something")), res3)
@@ -1329,6 +1343,14 @@ class KBsonTest {
                     _id = ObjectId("5d1777814e8c7b408a6ada73")
                 )
             ), res5
+        )
+        assertEquals(
+            SealedWrapper(
+                SMessage.DataWithObjectId(
+                    someData = "something",
+                    _id = ObjectId("5d1777814e8c7b408a6ada73")
+                )
+            ), res6
         )
     }
 

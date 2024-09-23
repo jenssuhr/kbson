@@ -3,7 +3,9 @@ package com.github.jershell.kbson
 import kotlinx.serialization.DeserializationStrategy
 import kotlinx.serialization.InternalSerializationApi
 import kotlinx.serialization.SerializationException
-import kotlinx.serialization.descriptors.*
+import kotlinx.serialization.descriptors.PolymorphicKind
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.descriptors.StructureKind
 import kotlinx.serialization.encoding.AbstractDecoder
 import kotlinx.serialization.encoding.CompositeDecoder
 import kotlinx.serialization.encoding.CompositeDecoder.Companion.UNKNOWN_NAME
@@ -18,18 +20,6 @@ abstract class FlexibleDecoder(
     override val serializersModule: SerializersModule,
     val configuration: Configuration
 ) : AbstractDecoder() {
-
-    /**
-     * _id field comes always first in MongoDb.
-     * Sometimes you may need to check if this id is not already read by the [reader]
-     * - and then you may need to set the [alreadyReadId] to null in order to specify that is has been taken into account.
-     */
-    open var alreadyReadId: Any?
-        get() = null
-        set(_) {
-            //do nothing
-        }
-
     override fun beginStructure(descriptor: SerialDescriptor): CompositeDecoder {
         return when (descriptor.kind) {
             StructureKind.CLASS -> {
@@ -37,7 +27,7 @@ abstract class FlexibleDecoder(
                 if (current == null || current == BsonType.DOCUMENT) {
                     reader.readStartDocument()
                 }
-                BsonFlexibleDecoder(reader, serializersModule, configuration, alreadyReadId)
+                BsonFlexibleDecoder(reader, serializersModule, configuration)
             }
             StructureKind.MAP -> {
                 reader.readStartDocument()
@@ -49,7 +39,7 @@ abstract class FlexibleDecoder(
             }
             is PolymorphicKind -> {
                 reader.readStartDocument()
-                PolymorphismDecoder(reader, serializersModule, configuration, alreadyReadId)
+                PolymorphismDecoder(reader, serializersModule, configuration)
             }
             else -> this
         }
@@ -136,7 +126,6 @@ class BsonFlexibleDecoder(
     reader: AbstractBsonReader,
     context: SerializersModule,
     configuration: Configuration,
-    override var alreadyReadId: Any? = null
 ) : FlexibleDecoder(reader, context, configuration) {
 
     //to handle not optional nullable properties
@@ -191,14 +180,6 @@ class BsonFlexibleDecoder(
 
     override fun decodeElementIndex(descriptor: SerialDescriptor): Int {
         initNotOptionalProperties(descriptor)
-        if (alreadyReadId != null) {
-            val idIndex = descriptor.getElementIndex("_id")
-            if (idIndex != UNKNOWN_NAME) {
-                return idIndex
-            } else {
-                alreadyReadId = null
-            }
-        }
 
         if (reader.state == State.TYPE) {
             reader.readBsonType()
@@ -233,43 +214,54 @@ class BsonFlexibleDecoder(
         }
         return null
     }
-
-    override fun decodeString(): String =
-        if (alreadyReadId != null) {
-            val result = alreadyReadId
-            alreadyReadId = null
-            result as? String ?: (result as ObjectId).toString()
-        } else {
-            super.decodeString()
-        }
 }
 
 private class PolymorphismDecoder(
     reader: AbstractBsonReader,
     val context: SerializersModule,
     configuration: Configuration,
-    override var alreadyReadId: Any? = null
 ) : FlexibleDecoder(reader, context, configuration) {
     private var decodeCount = 0
+    private var discriminatorValue: String? = null
 
     @InternalSerializationApi
     override fun <T> decodeSerializableValue(deserializer: DeserializationStrategy<T>): T =
-        deserializer.deserialize(BsonFlexibleDecoder(reader, context, configuration, alreadyReadId))
+        deserializer.deserialize(BsonFlexibleDecoder(reader, context, configuration))
 
     override fun decodeElementIndex(descriptor: SerialDescriptor): Int {
+        val classDiscriminator = descriptor.classDiscriminator()
         return when (decodeCount) {
             0 -> {
                 if (reader.state == State.TYPE) {
                     reader.readBsonType()
                 }
-                val fieldName = reader.readName()
-                if (fieldName == "_id") {
-                    alreadyReadId = when (reader.currentBsonType) {
-                        BsonType.OBJECT_ID -> reader.readObjectId()
-                        BsonType.STRING -> reader.readString()
-                        else -> error("only ObjectId or string are supported as _id for polymorphism decoder ")
+
+                val mark = reader.mark
+
+                while (discriminatorValue == null) {
+                    when(reader.state) {
+                        State.TYPE -> {
+                            reader.readBsonType()
+                        }
+                        State.NAME -> {
+                            val fieldName = reader.readName()
+                            if (fieldName == classDiscriminator) {
+                                discriminatorValue = reader.readString()
+                                break
+                            } else {
+                                reader.skipValue()
+                            }
+                        }
+                        else -> {
+                            return CompositeDecoder.DECODE_DONE
+                        }
                     }
                 }
+                if (discriminatorValue == null) {
+                    error("Class discriminator field '$classDiscriminator' not found")
+                }
+
+                mark.reset()
                 decodeCount++
             }
             1 -> {
@@ -277,6 +269,25 @@ private class PolymorphismDecoder(
             }
             else -> CompositeDecoder.DECODE_DONE
         }
+    }
+
+    override fun decodeString(): String  {
+        val currentDiscriminatorValue = discriminatorValue
+        return if (currentDiscriminatorValue != null) {
+            discriminatorValue = null
+            currentDiscriminatorValue
+        } else {
+            super.decodeString()
+        }
+    }
+
+    private fun SerialDescriptor.classDiscriminator(): String {
+        for (annotation in this.annotations) {
+            if (annotation is BsonClassDiscriminator) {
+                return annotation.discriminator
+            }
+        }
+        return configuration.classDiscriminator
     }
 }
 
